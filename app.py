@@ -447,12 +447,19 @@ def server(input:Inputs, output: Outputs, session:Session):
 
                         # remove counts prom perc table
                         for element in disaggregations_perc:
-                            if isinstance(element[0], pd.DataFrame):  
+                            if isinstance(element[0], pd.DataFrame):
                                 columns_to_drop = ['category_count', 'weighted_count', 'unweighted_count']
                                 # Drop each column if it exists in the DataFrame
+                                if "min" not in element[0].columns:
+                                    for column in columns_to_drop:
+                                        if column in element[0].columns:
+                                            element[0].drop(columns=column, inplace=True)
+                                else:
+                                    columns_to_drop = ['category_count', 'unweighted_count','general_count_uw']
                                 for column in columns_to_drop:
                                     if column in element[0].columns:
                                         element[0].drop(columns=column, inplace=True)
+                                element[0].rename(columns={'weighted_count': 'general_count'}, inplace=True)
                                         
                         # remove perc columns from weighted count table
                         for element in disaggregations_count_w:
@@ -710,6 +717,20 @@ def server(input:Inputs, output: Outputs, session:Session):
                                                            conditional_formating=check_formatting)
                                 buffer.seek(0)
                                 zipf.writestr(filename_constr,buffer.read())
+                            
+                            filename = 'request_file'+'_'+datetime.today().strftime('%Y_%m_%d')
+
+                            buffer = io.BytesIO()
+                            grouped_filename = filename + "_grouped.xlsx"
+                            construct_result_wide_table(disaggregations_perc_new, buffer)
+                            buffer.seek(0)
+                            zipf.writestr(grouped_filename, buffer.read())
+                            
+                            buffer = io.BytesIO()
+                            grouped_filename_count = grouped_filename.split('.')[0] + "_count" + ".xlsx"
+                            construct_count_wide_table(disaggregations_perc_new, buffer)
+                            buffer.seek(0)
+                            zipf.writestr(grouped_filename_count, buffer.read())
                                 
                         print("--- %s seconds ---" % (time.time() - start_time))
                         
@@ -728,3 +749,4 @@ def server(input:Inputs, output: Outputs, session:Session):
                               
   
 app = App(app_ui,server, debug=True)
+# app.run()
