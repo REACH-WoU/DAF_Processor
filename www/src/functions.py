@@ -6,6 +6,8 @@ import string
 import xlsxwriter
 from scipy.stats import chi2_contingency
 from statsmodels.formula.api import ols
+from scipy.stats import gaussian_kde
+from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings(
     "ignore", 'This pattern is interpreted as a regular expression, and has match groups.')
@@ -257,7 +259,62 @@ def map_names_ls(column_name, values_list, tool_survey, tool_choices,label_col, 
     values_list = [mapping_dict.get(value, value) for value in values_list]
     return values_list
 
-def weighted_mean(df, weight_column, numeric_column):
+def round_sig(x, sig):
+    """
+    Auxiliary function to round to significant digits
+    
+    Parameters:
+    ----------
+        x : float
+        sig : integer
+        
+    Returns:
+    -------
+        x rounded to sig digits
+    """
+    if x == 0:
+        return 0
+    return round(x, sig - int(np.floor(np.log10(abs(x)))) - 1)
+
+def smart_rounding(mean, moe):
+    """
+    Auxiliary function to do smart round of the mean and median
+    
+    Parameters:
+    ----------
+    mean : float
+        mean (or median) you'd like to round
+    moe : float
+        precalculated Margin of Error of the mean (median)
+    Returns:
+    -------
+        list
+        rounded mean (median) and rounded MoE
+    """
+    s = str(abs(moe)).replace('.', '')
+    non_zero_digits = [ch for ch in s if ch != '0']
+    
+    if len(non_zero_digits) > 1:
+        first_digit = int(non_zero_digits[0])
+        sec_digit = int(non_zero_digits[1])
+    else:
+        first_digit = int(non_zero_digits[0])
+        sec_digit = 0
+
+    if (first_digit == 1) & (sec_digit > 0):
+        sig_digits = 2
+    else:
+        sig_digits = 1
+    rounded_moe = round_sig(moe, sig_digits)
+
+    # Determine number of decimal places for final rounding
+    moe_order = -int(np.floor(np.log10(rounded_moe)))
+    decimals = moe_order if sig_digits == 1 else moe_order+1
+    rounded_mean = round(mean, decimals)
+
+    return rounded_mean, rounded_moe
+
+def weighted_mean(df, weight_column, numeric_column, add_moe=True):
     
     """
     Calculates the weighted mean, weighted median, and other summary statistics 
@@ -274,6 +331,13 @@ def weighted_mean(df, weight_column, numeric_column):
     numeric_column : str
         The name of the column in the DataFrame that contains the numeric values 
         for which the weighted statistics are calculated.
+        
+    add_moe : bool, optional
+        If True - counts confidence intevral for the mean using t-test and 
+        standard deviation obtained from stratification (assuming normal 
+        distribution within strata), rounds mean with respect to MoE.
+        If False - does not count margin of error, rounds mean to one digit 
+        after coma if all inputs are integer and to two digits otherwise. 
 
     Returns:
     -------
@@ -313,12 +377,80 @@ def weighted_mean(df, weight_column, numeric_column):
         min_of_two = np.min([median_index + 1, sorted_df.shape[0]-1])
         weighted_median_result = sorted_df.iloc[min_of_two][numeric_column]
     
-    return pd.Series({'mean': weighted_mean_result,
-                      'median':weighted_median_result,
-                      'max': weighted_max_result,
-                      'min': weighted_min_result,
-                      'unweighted_count' : count,
-                      'count': count_w})
+    # calculating MoE of the median for datasets with length > 1
+    if add_moe and len(df[numeric_column].to_numpy()) > 1:
+        # Estimate density at the median using weighted KDE
+        kde = gaussian_kde(df[numeric_column], weights=df[weight_column])
+        density_x = np.linspace(min(df[numeric_column],), max(df[numeric_column],), 1000)
+        density_y = kde(density_x)
+        f_interp = interp1d(density_x, density_y, fill_value="extrapolate")
+        fmed = float(f_interp(weighted_median_result))
+        # Calculate MoE of the median for 95% CL and rounding median
+        moe_median = 1.96 / (np.sqrt(4 * len(df[numeric_column])) * fmed)
+        if moe_median > 0:
+            weighted_median_result, moe_median = smart_rounding(weighted_median_result, moe_median)
+        else:
+            weighted_median_result = round(weighted_median_result, 1)
+    elif add_moe:
+        moe_median = None
+    else:    
+        # rounding median to one digit
+        weighted_median_result = round(weighted_median_result, 1)
+            
+    # calculating MoE of the mean
+    if add_moe and len(df[numeric_column].to_numpy()) > 1:
+        # group values by strata (weights)
+        x = df[numeric_column].to_numpy()
+        w = df[weight_column].to_numpy()
+        simple_df = pd.DataFrame({'x_value':x,'weight':w})
+        strata = simple_df.groupby('weight')
+        weighted_vars = []
+        weights = []
+        # looping throug strata
+        for stratum_value, group in strata:
+            x_value = group['x_value']
+            n = len(x_value)
+            if n==1:
+                var_x=(np.sum(x_value) - np.sum(w * x) / np.sum(w))**2 # we cannot calculate variance of one value, so it's like this - comparing to overall mean
+            else:
+                var_x = x_value.var(ddof=1)  # sample variance within stratum
+            # Treat the stratum_value as the weight (proxy for population share)
+            weight = stratum_value
+            weighted_vars.append((weight**2) * var_x / n)  # stratum-level variance contribution
+            weights.append(weight)
+        # Variance of weighted mean (stratified)
+        var_weighted_mean = sum(weighted_vars) / (sum(weights)**2)
+        # Calculate MoE of the mean for 95% CL and rounding mean
+        moe_mean = 1.96 * np.sqrt(var_weighted_mean)
+        if moe_mean > 0:
+            weighted_mean_result, moe_mean = smart_rounding(weighted_mean_result, moe_mean)
+        else:
+            weighted_mean_result = round(weighted_mean_result, 2)
+    elif add_moe:
+        moe_mean = None
+    else:
+        # rounding mean to two digits 
+        weighted_mean_result = round(weighted_mean_result, 2)
+            
+    weighted_max_result = round(weighted_max_result, 1)
+    weighted_min_result = round(weighted_min_result, 1)
+    if add_moe:
+        output = pd.Series({'mean': weighted_mean_result,
+                          'moe_mean' : moe_mean,
+                          'median':weighted_median_result,
+                          'moe_median': moe_median,
+                          'max': weighted_max_result,
+                          'min': weighted_min_result,
+                          'unweighted_count' : count,
+                          'count': count_w})
+    else:
+        output = pd.Series({'mean': weighted_mean_result,
+                          'median':weighted_median_result,
+                          'max': weighted_max_result,
+                          'min': weighted_min_result,
+                          'unweighted_count' : count,
+                          'count': count_w})
+    return output
 
 
 def get_variable_type(data, variable_name):
@@ -581,10 +713,10 @@ def custom_sort_key(value):
         If the value is 'Total' makes sure that it'll be the last on the list. Else, it's just a value
 
     """
-    if value in 'Total' and isinstance(value, str):
-        return 'zzzzzzzzzzz'  # This super dumb but it works
+    if isinstance(value, str) and 'Total' in value:
+        return (1, value)
     else:
-        return value
+        return (0, value)
 
 
 def make_pivot(table, index_list, column_list, value):
@@ -695,8 +827,8 @@ def col_num_to_excel(col_num):
         # For columns beyond 'Z', handle multi-letter column names (e.g., 26 -> AA, 27 -> AB)
         return col_num_to_excel(col_num // 26 - 1) + letters[col_num % 26]
 
-
-def construct_result_table(tables_list, file_name, make_pivot_with_strata=False, color_cells=True, sort_by_total=False, conditional_formating=True):
+# Added here a function to automatically highlight with red rows with sample <30
+def construct_result_table(tables_list, file_name, make_pivot_with_strata=False, color_cells=True, color_less30=True, sort_by_total=False, conditional_formating=True):
     
     """
     Constructs an Excel workbook containing pivot tables from a list of DataFrames.
@@ -721,7 +853,8 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
 
     color_cells : bool, optional
         If True, applies color formatting to cells based on their values. Default is True.
-
+    color_less30 : bool, optional
+        If True, highlights with red rows with sample size <30
     sort_by_total : bool, optional
         If True, sorts the pivot table by total values. Default is False.
 
@@ -758,7 +891,8 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
     data_sheet = workbook.add_worksheet("Data")
     # Create a counter
     link_idx = 1
-
+    # Define numeric columns
+    numeric_output_cols = ['mean','moe_mean','meadian','moe_median','min','max']
     # Define formatting
     percent_format = workbook.add_format({"num_format": "0.00%"})
     round_format = workbook.add_format({"num_format": "0.00"})
@@ -778,7 +912,6 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
 
     for idx, element in enumerate(tables_list):
         table, ID, label, significance = element
-        # print(ID)
         cols_tbl = table.columns
         # The colums that will be added in the pivot
         pivot_column_names = {'disaggregations_category_1', 'oblast', 'macroregion'}
@@ -788,14 +921,14 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
             values_variable = "perc"
         else:
             # If we have mulptiple frequencies (case of joining) we have a list of values variables
-            if any([x.startswith(('perc_','median_','mean_','max_','min_','category_count_')) for x in cols_tbl]):
+            if any([x.startswith(('perc_','median_','mean_','max_','min_','category_count_')) for x in cols_tbl]) and not any([x =='category_count_max' for x in cols_tbl]):
                 values_variable = [x for x in cols_tbl if x.startswith(('perc_','median_','mean_','max_','min_','category_count_'))]
             # category count can exist within the mean tables too and requires different treatment
             # basically mean is a simple table of means
             # count_mean is the count of that table created for count excel files
-            elif 'mean' in table.columns and 'category_count' not in table.columns:
+            elif any([x.startswith('mean') for x in table.columns]) and not any([x.startswith('category_count') for x in table.columns]):
                values_variable = "mean"
-            elif 'mean' in table.columns and 'category_count'  in table.columns:
+            elif any([x.startswith('mean') for x in table.columns]) and any([x.startswith('category_count') for x in table.columns]):
                 values_variable = 'count_mean'
             else:
                 values_variable = 'category_count'
@@ -810,7 +943,7 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
         missed_cols = set(columns).difference(['disaggregations_category_1'])
         if len(missed_cols)>0:
             pivot_columns.extend(list(missed_cols))
-            
+
         # case of perc and counts is the same
         if values_variable in ["perc" ,'category_count']:
             if make_pivot_with_strata:
@@ -831,21 +964,32 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
                     pivot_table = make_pivot(
                         table, pivot_columns + ["option"], ["admin_category"], values_variable)
             else:
+                
+                if "general_count_max" in cols_tbl:
+                    general_count_column = "general_count_max"
+                else:
+                    general_count_column = "general_count"
+
                 # The sample count variable is added here
-                if 'general_count' in cols_tbl:
-                    pivot_columns.append('general_count')
+                if general_count_column in cols_tbl:
+                    pivot_columns.append(general_count_column)
                     
                 # get the option values for sorting
                 options_column = table["option"].unique()
 
                 # replace general_count NA values for 'Total' rows woth full_count
-                table['general_count'] = table['general_count'].fillna(table['full_count'])
-                
+                table[general_count_column] = table[general_count_column].fillna(table['full_count'])
+
                 pivot_table = make_pivot(
-                    table, pivot_columns + ["admin_category", "full_count"], ["option"], values_variable)
+                    table, pivot_columns + ["admin_category"], ["option"], values_variable)
+                
                 # sort the values by the custom sort key
                 pivot_table = pivot_table.sort_values(
                     by='admin_category', key=lambda x: x.map(custom_sort_key)).reset_index(drop=True)
+
+                mask = pivot_table['admin_category'] == 'Total'
+                total_value = pivot_table.loc[~mask, general_count_column].sum()
+                pivot_table.loc[mask, general_count_column] = total_value
                 
                 # if sorted by total apply a different sorting algorithm
                 if sort_by_total:
@@ -877,27 +1021,38 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
                     )
         # If the values variable is count_mean, we only need the count itself for our tables. 
         elif values_variable == 'count_mean':
+            if "category_count_max" in cols_tbl:
+                category_count_column = "category_count_max"
+            else:
+                category_count_column = "category_count"
+
             table = table.reset_index(drop = True)
-            cols_to_drop = ['ID','variable','admin','disaggregations_1','total_count_perc','min','max','median','mean']
+            cols_to_drop = ['ID', 'variable','admin','disaggregations_1','total_count_perc', 'full_count'] + [x for x in table.columns if x.startswith(('min','max','median','moe','mean','moe'))]
             cols_to_keep = [i for i in table.columns if i not in cols_to_drop]
             if make_pivot_with_strata:
-                pivot_table = make_pivot(table, pivot_columns, ["admin_category"], 'category_count')
+                pivot_table = make_pivot(table, pivot_columns, ["admin_category"], category_count_column)
             else:
                 pivot_table = table[cols_to_keep]
-                
-        elif values_variable == 'mean':
+            
+            mask = pivot_table['admin_category'] == 'Total'
+            total_value = pivot_table.loc[~mask, category_count_column].sum()
+            pivot_table.loc[mask, category_count_column] = total_value
+        
+        elif (values_variable == 'mean' or any(item.startswith("mean") for item in values_variable)):
+            # and not any(item.startswith("category_count") for item in values_variable)
             if make_pivot_with_strata:
                 # add numeric columns as a single one by melting the frame
                 table = table.reset_index()
-                ids = pivot_columns+['ID','admin_category']
-                table = pd.melt(table, id_vars=ids, value_vars=['median', 'mean', 'max','min'])
+                ids = pivot_columns+['ID', 'admin_category']
+                value_vars = [col for col in numeric_output_cols if col in cols_tbl]
+                table = pd.melt(table, id_vars=ids, value_vars=value_vars)
                 # add new columns to pivot
                 values_variable = 'value'
                 pivot_columns = pivot_columns +['variable']
                 pivot_table = make_pivot(table, pivot_columns, ["admin_category"], values_variable)
             else:
                 # if it's just a regular table - remove excessive information
-                cols_to_drop = ['ID','variable','admin','disaggregations_1','total_count_perc']
+                cols_to_drop = ['ID','variable','admin','disaggregations_1','total_count_perc', 'full_count']
                 cols_to_keep = [i for i in cols_tbl if i not in cols_to_drop]
                 pivot_table = table[cols_to_keep]
         else:
@@ -905,20 +1060,20 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
             category_count_columns = [x for x in cols_tbl if x.startswith('category_count_')]
             # and keep only count columns
             cols_to_keep = ([x for x in cols_tbl if '_category' in x]
-            +(['option']  if 'option' in cols_tbl else [])
+            +(['option'] if 'option' in cols_tbl else [])
             +(category_count_columns if category_count_columns else
             [x for x in cols_tbl if x.startswith(('perc_','median_','mean_','max_','min_'))])
-            +[x for x in cols_tbl if x.endswith('_count')])
+            +[x for x in cols_tbl if x.endswith('_count_max')])
             # and keep only what we need. No need to pivot if the tables were joined
             pivot_table = table[cols_to_keep]
             
         if 'macroregion' in pivot_table.columns:
             pivot_table = pivot_table.sort_values(by='macroregion')    
 
-        cols_to_drop = ['mean','median','min','max']
+        cols_to_drop = ['mean', 'moe_mean','median','moe_median','min','max']
         # drop unnecessary variables if needed
         if values_variable == 'count_mean':
-            cols_to_drop = ['mean','median','min','max']+[x for x in cols_tbl if x.startswith(('median_','mean_','max_','min_'))]
+            cols_to_drop = ['mean', 'moe_mean','median','moe_median','min','max']+[x for x in cols_tbl if x.startswith(('median_','mean_','max_','min_'))]
             cols_to_keep = [i for i in pivot_table.columns if i not in cols_to_drop]
             pivot_table = pivot_table[cols_to_keep]
         
@@ -941,16 +1096,15 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
         for row_num, row in pivot_table.iterrows():
             for col_num, (column_name, value) in enumerate(row.items()):
                 if column_name not in ['disaggregations_category_1', 'disaggregations_category_2', 'admin_category', 'option', 
-                            'strata_name', 'raion', 'oblast', 'macroregion',
-                            'mean', 'median', 'max' ,'min', 'disaggregations_category_3'
-                            'count','full_count','weighted_count','unweighted_count','category_count','general_count']:
+                            'strata_name', 'raion', 'oblast', 'macroregion', 'disaggregations_category_3'
+                            'count', 'full_count','weighted_count','unweighted_count','category_count', 'category_count_max', 'general_count', 'general_count_max'] and not column_name.startswith("mean")\
+                            and not column_name.startswith("moe_") and not column_name.startswith("median") and not column_name.startswith("max") and not column_name.startswith("min"):
                     if pd.isna(value):
                         data_sheet.write(row_num + 2 +cell_id, col_num, None)
                     elif values_variable not in ["mean", "count_mean", "value", "category_count"]:
                         data_sheet.write(row_num + 2 +cell_id, col_num, value, percent_format)
                     else:
                         data_sheet.write(row_num + 2 +cell_id, col_num, value, round_format)
-                
                 else:
                     if pd.isna(value):
                         data_sheet.write(row_num + 2 +cell_id, col_num, None)
@@ -960,12 +1114,12 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
         #color code the percentages
         if  values_variable =='perc' or any(str(col).startswith('perc') for col in pivot_table.columns):
             # get the columns to exclude
-            exclude_prefixes = ['median_','mean_','max_','min_']
+            exclude_prefixes = ['median_','mean_','max_','min_', 'moe_']
             
             exclude_columns = ['disaggregations_category_1', 'disaggregations_category_2', 'admin_category', 'option', 
                             'strata_name', 'raion', 'oblast', 'macroregion',
-                            'mean', 'median', 'max' ,'min', 'disaggregations_category_3',
-                            'count','full_count','weighted_count','unweighted_count','category_count','general_count']
+                            'mean', 'moe_mean', 'median','moe_median', 'max' ,'min', 'disaggregations_category_3',
+                            'count','full_count','weighted_count','unweighted_count','category_count', 'category_count_max', 'general_count', 'general_count_max']
             # get the columns that need to be color coded and formated
             desired_columns = [col for col in pivot_table.columns if col not in exclude_columns or any(col.startswith(prefix) for prefix in exclude_prefixes)]
             # the table column extent
@@ -986,9 +1140,9 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
                                     { 'type' : 'no_blanks' ,
                                     'format' : border_format} )
         # Means are formatted differently
-        elif  values_variable =='mean' or any(str(col).startswith('mean_') for col in pivot_table.columns):
+        elif  values_variable == 'mean' or any(str(col).startswith('mean_') for col in pivot_table.columns):
             # Get the list of relevant columns
-            desired_columns =   [col for col in pivot_table.columns if str(col).startswith(('mean_','median_','max_','min_')) or col in ['mean','median','max','min']]         
+            desired_columns =   [col for col in pivot_table.columns if str(col).startswith(('mean_','median_','max_','min_', 'moe_')) or col in ['mean', 'moe_mean','median','moe_median','max','min']]         
             # the table column extent
             first_column_index = pivot_table.columns.get_loc(desired_columns[0])
             last_column_index = pivot_table.columns.get_loc(desired_columns[-1])
@@ -1004,7 +1158,6 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
                     
                     column_index = pivot_table.columns.get_loc(des_col)
                     
-                    
                     first_cell_c = f"{col_num_to_excel(column_index)}{names_id+2}"
                     last_cell_c = f"{col_num_to_excel(column_index)}{len(pivot_table)+names_id+1}"
                     data_sheet.conditional_format(f"{first_cell_c}:{last_cell_c}", 
@@ -1012,8 +1165,8 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
                                     'min_value': min_val,
                                     'max_value': max_val})
 
-                data_sheet.conditional_format( f"{first_cell}:{last_cell}" ,
-                                                { 'type' : 'no_blanks' ,
+                data_sheet.conditional_format(f"{first_cell}:{last_cell}" ,
+                                                {'type' : 'no_blanks' ,
                                                 'format' : border_format} )
                       
         # Format the contents sheet
@@ -1043,7 +1196,7 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
     workbook.close()
 
 
-def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, tool_survey,label_colname, check_significance, weight_column=None):
+def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, tool_survey,label_colname, check_significance, add_moe, weight_column=None):
 
     """
     Creates disaggregated data tables based on specified configurations and conditions.
@@ -1080,6 +1233,9 @@ def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, too
     check_significance : bool
         A flag indicating whether to perform statistical significance tests on the disaggregated 
         results.
+        
+    add_moe : bool
+        A flag indicating whether to add Margin of Error and smart rounding for mean and median.
 
     weight_column : str, optional
         The name of the column used for weighting responses in the calculations. If not provided, 
@@ -1109,7 +1265,12 @@ def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, too
         for sheet in data:
             data[sheet]['weight'] = 1
         weight_column = 'weight'
-
+    
+    # Check if needs to add MoE columns
+    if add_moe:
+        numeric_output_cols = ['mean','moe_mean','median','moe_median','min','max']
+    else:
+        numeric_output_cols = ['mean','median','min','max']
     # get only the relevant functions from the daf and split the object in two
     # Separate processes will be applied for numeric and frequency analyses
     daf_final_freq = daf_final[daf_final['func'].isin(
@@ -1574,9 +1735,8 @@ def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, too
                     res_frame_num = ''
                 
                 # get the general disaggregations statistics
-
                 summary_stats = data_temp.groupby(groupby_columns).apply(
-                    weighted_mean, weight_column=weight_column, numeric_column=daf_final_num['variable'][i])
+                    weighted_mean, weight_column=weight_column, numeric_column=daf_final_num['variable'][i], add_moe=add_moe)
 
                 summary_stats = summary_stats.reset_index()
                 
@@ -1629,7 +1789,7 @@ def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, too
                 # if total is added, then it requires a bit different calculations
                 if 'add_total' in calc:
                     summary_stats_total = weighted_mean(
-                        data_temp, weight_column=weight_column, numeric_column=daf_final_num['variable'][i]).to_frame().transpose()
+                        data_temp, weight_column=weight_column, numeric_column=daf_final_num['variable'][i],add_moe=add_moe).to_frame().transpose()
 
                     # add new columns to match the existing format
                     summary_stats_total['admin'] = 'Total'
@@ -1666,8 +1826,7 @@ def disaggregation_creator(daf_final, data, filter_dictionary, tool_choices, too
                     col for col in summary_stats.columns if col.startswith('disaggregations') and not col.endswith('orig')]
                 summary_stats['ID'] = daf_final_num.iloc[i]['ID']
                 columns = ['ID', 'admin', 'admin_category', 'variable'] + \
-                    disagg_columns + ['mean', 'median','min',
-                                      'max', 'weighted_count','unweighted_count' ,'full_count','total_count_perc']+og_columns
+                    disagg_columns + numeric_output_cols + ['weighted_count','unweighted_count' ,'full_count','total_count_perc']+og_columns
                 summary_stats = summary_stats[columns]
                 # Append the tupple to the list
                 df_list.append((summary_stats, daf_final_num['ID'][i], label,res_frame_num))
@@ -1731,6 +1890,7 @@ def construct_result_wide_table(tables_list, file_name):
     """
     numeric_list = []
     freq_list = []
+    numeric_output_cols = ['mean','moe_mean','meadian','moe_median','min','max']
 
     for idx, element in enumerate(tables_list):
         table, ID, label, significance = element
@@ -1761,7 +1921,7 @@ def construct_result_wide_table(tables_list, file_name):
         # if we have multiple disaggregations, only the first one will be considered for pivoting
         columns = [x for x in cols_tbl if ('disaggregations_category_' in x)]
         missed_cols = set(columns).difference(['disaggregations_category_1'])
-        if len(missed_cols)>0:
+        if len(missed_cols) > 0:
             pivot_columns.extend(list(missed_cols))
             
         # case of perc and counts is the same
@@ -1784,26 +1944,27 @@ def construct_result_wide_table(tables_list, file_name):
             else:
                 # else just pivot the frame regularly
                 pivot_table = make_pivot(
-                    table, pivot_columns + ["option"], ["admin_category"], values_variable)
-                
-        elif values_variable == 'mean':
+                    table, pivot_columns + ["option"], ["admin_category"], values_variable)        
+        # elif values_variable == 'mean':
+        elif values_variable == "mean" or any(item.startswith("mean") for item in values_variable):
             mean_table_backup = table.copy()
             # add numeric columns as a single one by melting the frame
             table = table.reset_index()
             ids = pivot_columns+['ID', 'admin_category']
-            table = pd.melt(table, id_vars=ids, value_vars=['median', 'mean', 'max','min'])
+            value_vars = [col for col in numeric_output_cols if col in cols_tbl]
+            table = pd.melt(table, id_vars=ids, value_vars=value_vars)
             # add new columns to pivot
             values_variable = 'value'
             pivot_columns = pivot_columns + ['variable']
             pivot_table = make_pivot(table, pivot_columns, ["admin_category"], values_variable)
-            
+
         if 'macroregion' in pivot_table.columns:
             pivot_table = pivot_table.sort_values(by='macroregion')    
 
-        cols_to_drop = ['mean','median','min','max']
+        cols_to_drop = ['mean', 'moe_mean','median','moe_median','min','max', 'full_count']
         # drop unnecessary variables if needed
         if values_variable == 'count_mean':
-            cols_to_drop = ['mean','median','min','max']+[x for x in cols_tbl if x.startswith(('median_','mean_','max_','min_'))]
+            cols_to_drop = ['mean', 'moe_mean','median','moe_median','min','max', 'full_count']+[x for x in cols_tbl if x.startswith(('median_','mean_','max_','min_'))]
             cols_to_keep = [i for i in pivot_table.columns if i not in cols_to_drop]
             pivot_table = pivot_table[cols_to_keep]
 
@@ -1815,9 +1976,8 @@ def construct_result_wide_table(tables_list, file_name):
                 question_label += " by "
             for idx, dis in enumerate(dissagr_col):
                 question_label += mean_table_backup[f"disaggregations_{idx + 1}"].values[0] + " "
-
+            
             pivot_table["question"] = question_label
-
             numeric_list.append((pivot_table, pivot_table["question"].values[0], mean_table_backup["admin"].values[0]))
 
         if values_variable in ["perc"]:
@@ -1851,8 +2011,11 @@ def construct_result_wide_table(tables_list, file_name):
                 else:
                     concated_table = concated_table[["question", "option"] + dissagr_col + [col for col in concated_table.columns if col not in ["question", "option"] + dissagr_col]]
             else:
-                concated_table.rename(columns={"Total": "total_for_question"}, inplace=True)
-                concated_table = concated_table[["question", "variable"] + dissagr_col + ["total_for_question"] + [col for col in concated_table.columns if col not in ["question", "variable"] + dissagr_col + ["total_for_question"]]]
+                if "Total" in concated_table.columns:
+                    concated_table.rename(columns={"Total": "total_for_question"}, inplace=True)
+                    concated_table = concated_table[["question", "variable"] + dissagr_col + ["total_for_question"] + [col for col in concated_table.columns if col not in ["question", "variable"] + dissagr_col + ["total_for_question"]]]
+                else:
+                    concated_table = concated_table[["question", "variable"] + dissagr_col + [col for col in concated_table.columns if col not in ["question", "variable"] + dissagr_col]]
             grouped[admin] = concated_table
         
         return grouped
@@ -1987,7 +2150,7 @@ def construct_count_wide_table(tables_list, file_name):
         missed_cols = set(columns).difference(['disaggregations_category_1'])
         if len(missed_cols)>0:
             pivot_columns.extend(list(missed_cols))
-            
+        
         # case of perc and counts is the same
         if values_variable in ["general_count_perc"]:
             table["general_count"] = table["general_count"].fillna(0)
@@ -2001,8 +2164,8 @@ def construct_count_wide_table(tables_list, file_name):
 
             if "Total" in pivot_table.columns:
                 pivot_table = pivot_table.drop(columns=["Total"])
-                
-        elif values_variable == 'general_count_mean':
+              
+        elif values_variable == 'general_count_mean' or any(item.startswith("mean") for item in values_variable):
             mean_table_backup = table.copy()
             # add numeric columns as a single one by melting the frame
             table = table.reset_index()
@@ -2026,7 +2189,11 @@ def construct_count_wide_table(tables_list, file_name):
                 question_label += mean_table_backup[f"disaggregations_{idx + 1}"].values[0] + " "
 
             pivot_table["question"] = question_label
-            pivot_table = pivot_table.drop(columns=["variable", "Total"])
+            if "variable" in pivot_table.columns:
+                pivot_table = pivot_table.drop(columns=["variable"])
+
+            if "Total" in pivot_table.columns:
+                pivot_table = pivot_table.drop(columns=["Total"])
 
             numeric_list.append((pivot_table, pivot_table["question"].values[0], mean_table_backup["admin"].values[0]))
 

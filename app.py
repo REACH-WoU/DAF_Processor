@@ -71,6 +71,7 @@ app_ui = ui.page_fluid(
                             ),
                         ui.input_checkbox('checkbox_sign','Would you like to run a significance check on your data?'),
                         ui.input_checkbox('checkbox_form','Would you like to add conditional formatting to your tables?'),
+                        ui.input_checkbox('checkbox_moe','Would you like to add margin of error for numeric statistics?'),
 
                         ui.download_button("download_data", "Process your request"),
                         ui.HTML('<br>'),
@@ -281,6 +282,11 @@ def server(input:Inputs, output: Outputs, session:Session):
             check_formatting = True
         else:
             check_formatting = False
+
+        if input.checkbox_moe():
+            add_moe = True
+        else:
+            add_moe = False
                     
         start_time = time.time()
         if all([input.file_tool, input.file_data, input.file_daf]):
@@ -432,7 +438,7 @@ def server(input:Inputs, output: Outputs, session:Session):
                         
                         print('Building your tables')
                         # analyse the data here
-                        disaggregations_full = disaggregation_creator(daf_final, data,filter_dict, tool_choices, tool_survey, label_colname = label_column, check_significance= check_signfic, weight_column =weighting_column)
+                        disaggregations_full = disaggregation_creator(daf_final, data,filter_dict, tool_choices, tool_survey, label_colname = label_column, check_significance= check_signfic, weight_column = weighting_column, add_moe=add_moe)
                         print('building the outputs')
                         disaggregations_orig = deepcopy(disaggregations_full) # analysis key table
 
@@ -448,19 +454,22 @@ def server(input:Inputs, output: Outputs, session:Session):
                         # remove counts prom perc table
                         for element in disaggregations_perc:
                             if isinstance(element[0], pd.DataFrame):
-                                columns_to_drop = ['category_count', 'weighted_count', 'unweighted_count']
+                                
                                 # Drop each column if it exists in the DataFrame
                                 if "min" not in element[0].columns:
+                                    columns_to_drop = ['general_count', 'weighted_count', 'unweighted_count']
                                     for column in columns_to_drop:
                                         if column in element[0].columns:
                                             element[0].drop(columns=column, inplace=True)
+                                    element[0].rename(columns={'general_count_uw': 'general_count'}, inplace=True)
                                 else:
-                                    columns_to_drop = ['category_count', 'unweighted_count','general_count_uw']
-                                for column in columns_to_drop:
-                                    if column in element[0].columns:
-                                        element[0].drop(columns=column, inplace=True)
-                                element[0].rename(columns={'weighted_count': 'general_count'}, inplace=True)
-                                        
+                                    columns_to_drop = ['category_count', 'weighted_count', 'general_count_uw']
+                                    for column in columns_to_drop:
+                                        if column in element[0].columns:
+                                            element[0].drop(columns=column, inplace=True)
+                                    element[0].rename(columns={'unweighted_count': 'general_count'}, inplace=True)
+
+
                         # remove perc columns from weighted count table
                         for element in disaggregations_count_w:
                             if isinstance(element[0], pd.DataFrame):  
@@ -469,15 +478,17 @@ def server(input:Inputs, output: Outputs, session:Session):
                                     if column in element[0].columns:
                                         element[0].drop(columns=column, inplace=True)
                                 element[0].rename(columns={'weighted_count': 'category_count'}, inplace=True)
-                
+                                
                         # remove perc columns from unweighted count table
                         for element in disaggregations_count:
                             if isinstance(element[0], pd.DataFrame):  
-                                columns_to_drop = ['perc', 'weighted_count']
+                                columns_to_drop = ['perc', 'weighted_count','general_count']
                                 for column in columns_to_drop:
                                     if column in element[0].columns:
                                         element[0].drop(columns=column, inplace=True)
                                 element[0].rename(columns={'unweighted_count': 'category_count'}, inplace=True)
+                                if "min" not in element[0].columns:
+                                    element[0].rename(columns={'general_count_uw': 'general_count'}, inplace=True)
 
 
                         # Get the columns for Analysis key table 
@@ -527,9 +538,12 @@ def server(input:Inputs, output: Outputs, session:Session):
                         disaggregations_perc_new = disaggregations_perc.copy()
                         disaggregations_count_new  = disaggregations_count.copy()
                         disaggregations_count_w_new  = disaggregations_count_w.copy()
+
+                        disaggregations_perc_new_for_group = disaggregations_perc_new.copy()
+
                         # check if any joining is needed
                         for data_frame in [disaggregations_perc_new,disaggregations_count_new,disaggregations_count_w_new]:
-
+                            # check if any joining is needed
                             if pd.notna(daf_final['join']).any():
 
                                 # get other children here
@@ -537,89 +551,100 @@ def server(input:Inputs, output: Outputs, session:Session):
 
                                 if any(child_rows['ID'].isin(child_rows['join'])):
                                     raise ValueError('Some of the join tables are related to eachother outside of their relationship with the parent row. Please fix this')
-                                else:
-                                    for index, child_row in child_rows.iterrows():
-                                        child_index = child_row['ID']
-                
-                                        if child_index not in daf_final['ID'].values:
-                                            raise ValueError(f'The specified parent index in join column for child row ID = {child_index} doesnt exist in the DAF file')
-                                        else:
-                    
-                                            parent_row = daf_final[daf_final['ID'].isin(child_row[['join']])]
-                                            parent_index = parent_row.iloc[0]['ID']
+                                
 
-                                            # check that the rows are idential
-                                            parent_check = parent_row[['disaggregations','func','calculation','admin','q.type']].reset_index(drop=True)
-                                            child_check = child_row.to_frame().transpose()[['disaggregations','func','calculation','admin','q.type']].reset_index(drop=True)
-                                            
-                                            parent_check = parent_check.infer_objects(copy=False).fillna('I am empty')
-                                            child_check = child_check.infer_objects(copy=False).fillna('I am empty')
-
-                                            check_result = child_check.equals(parent_check)
-
-                                            if not check_result:
-                                                raise ValueError(f"Joined rows (parent: {str(parent_row['ID'].values)} and child: {str(child_row['ID'])}) are not identical in terms of admin, calculations, function and disaggregations")
-                                            else:
-                                                # get the data and dataframe indeces of parents and children
-                                                child_tupple = [(i,tup) for i, tup in enumerate(data_frame) if tup[1] == child_index]
-                                                parent_tupple = [(i, tup) for i, tup in enumerate(data_frame) if tup[1] == parent_index]
-
-                                                child_tupple_data = child_tupple[0][1][0].copy()
-                                                child_tupple_index = child_tupple[0][0]
-                                                parent_tupple_data = parent_tupple[0][1][0].copy()
-                                                parent_tupple_index = parent_tupple[0][0]
-                                                
-                                                if parent_tupple_data['variable'][0] == child_tupple_data['variable'][0]:
-                                                    var_parent = parent_tupple_data['variable'][0] + '_' +str(parent_tupple_data['ID'][0])
-                                                    var_child = child_tupple_data['variable'][0] + '_' + str(child_tupple_data['ID'][0])
-                                                else:
-                                                    var_parent = parent_tupple_data['variable'][0] 
-                                                    var_child = child_tupple_data['variable'][0] 
-                                                
+                                for index, child_row in child_rows.iterrows():
+                                    child_index = child_row['ID']
+                                    
+                                    if child_index not in daf_final['ID'].values:
+                                        raise ValueError(f'The specified parent index in join column for child row ID = {child_index} doesnt exist in the DAF file')
+                                    
+                                    parent_row = daf_final[daf_final['ID'].isin(child_row[['join']])]
+                                    parent_index = parent_row.iloc[0]['ID']
 
 
-                                                # rename the data so that they are readable
-                                                varnames = [var_parent,var_child]
-                                                dataframes =[parent_tupple_data, child_tupple_data]
+                                    # check that the rows are idential
+                                    parent_check = parent_row[['disaggregations','func','calculation','admin','q.type']].reset_index(drop=True)
+                                    child_check = child_row.to_frame().transpose()[['disaggregations','func','calculation','admin','q.type']].reset_index(drop=True)
 
-                                                for var, dataframe in  zip(varnames, dataframes):
-                                                    rename_dict = {'mean': 'mean_'+var,'median': 'median_'+var ,'count': 'count_'+var,
-                                                                    'weighted_count': 'weighted_count_'+var,'unweighted_count': 'unweighted_count_'+var,
-                                                                    'category_count': 'category_count_'+var,
-                                                                    'perc': 'perc_'+var,'min': 'min_'+var, 'max': 'max_'+var}
+                                    # transform None to be of the same type
+                                    parent_check = parent_check.infer_objects(copy=False).fillna('I am empty')
+                                    child_check = child_check.infer_objects(copy=False).fillna('I am empty')
+                                    
+                                    check_result = child_check.equals(parent_check)
+                                    if not check_result:
+                                        raise ValueError(f"Joined rows (parent: {str(parent_row['ID'].values)} and child: {str(child_row['ID'])}) are not identical in terms of admin, calculations, function and disaggregations")
+                                    # get the data and dataframe indeces of parents and children
+                                    child_tupple = [(i,tup) for i, tup in enumerate(data_frame) if tup[1] == child_index]
+                                    parent_tupple = [(i, tup) for i, tup in enumerate(data_frame) if tup[1] == parent_index]
 
-                                                    for old_name, new_name in rename_dict.items():
-                                                        if old_name in dataframe.columns:
-                                                            dataframe.rename(columns={old_name: new_name},inplace=True)
+                                    child_tupple_data = child_tupple[0][1][0].copy()
+                                    child_tupple_index = child_tupple[0][0]
+                                    parent_tupple_data = parent_tupple[0][1][0].copy()
+                                    parent_tupple_index = parent_tupple[0][0]
+                                    # rename the data so that they are readable
+                                    if parent_tupple_data['variable'][0] == child_tupple_data['variable'][0]:
+                                        var_parent = parent_tupple_data['variable'][0] + '_' +str(parent_tupple_data['ID'][0])
+                                        var_child = child_tupple_data['variable'][0] + '_' + str(child_tupple_data['ID'][0])
+                                        warnings.warn("Some of the rows you're joining have the same variable label. This won't look nice")
+                                    else:
+                                        var_parent = parent_tupple_data['variable'][0] 
+                                        var_child = child_tupple_data['variable'][0] 
+                                    
+                                    varnames = [var_parent,var_child]
+                                    dataframes =[parent_tupple_data, child_tupple_data]
+
+                                    for var, dataframe in  zip(varnames, dataframes):
+                                        rename_dict = {'mean': 'mean_'+var,'moe_mean': 'moe_mean_'+var,'median': 'median_'+var ,'moe_median': 'moe_median_'+var, 'count': 'count_'+var, 
+                                                    'weighted_count': 'weighted_count_'+var,'unweighted_count': 'unweighted_count_'+var,
+                                                    'category_count': 'category_count_'+var, 'general_count': 'general_count_'+var,
+                                                    'perc': 'perc_'+var,'min': 'min_'+var, 'max': 'max_'+var}
+
+                                        for old_name, new_name in rename_dict.items():
+                                            if old_name in dataframe.columns:
+                                                dataframe.rename(columns={old_name: new_name},inplace=True)
 
 
-                                                # get the lists of columns to keep and merge
-                                                columns_to_merge = [item for item in parent_tupple_data.columns if 'disaggregations' in item  or 'admin' in item]
-                                                if 'option' in  parent_tupple_data.columns:
-                                                    columns_to_merge=columns_to_merge+['option']
-                                                    
-                                                columns_to_keep = columns_to_merge+ list(rename_dict.values())
+                                    # get the lists of columns to keep and merge
+                                    columns_to_merge = [item for item in parent_tupple_data.columns if 'disaggregations' in item  or 'admin' in item]
+                                    if 'option' in  parent_tupple_data.columns:
+                                        columns_to_merge=columns_to_merge+['option']
+                                        
+                                    columns_to_keep = columns_to_merge+ list(rename_dict.values())
 
-                                                parent_tupple_data= parent_tupple_data.merge(
-                                                child_tupple_data[child_tupple_data.columns.intersection(columns_to_keep)], 
-                                                on = columns_to_merge,how='left')
+                                    parent_tupple_data= parent_tupple_data.merge(
+                                        child_tupple_data[child_tupple_data.columns.intersection(columns_to_keep)], 
+                                        on = columns_to_merge,how='left')
 
 
+                                    parent_index_f = parent_tupple[0][1][1]
 
-                                                parent_index_f = parent_tupple[0][1][1]
-                                                
-                                                
-                                                parent_label_f = str(parent_tupple[0][1][2])
-            
-                                                
-                                                if str(child_tupple[0][1][3]) != '':
-                                                    parent_sig_f = str(child_tupple[0][1][3])+' & '+ str(parent_tupple[0][1][3])
-                                                else:
-                                                    parent_sig_f = ''
+                                    parent_label_f = str(parent_tupple[0][1][2])
+                                        
+                                    if str(child_tupple[0][1][3]) != '':
+                                        parent_sig_f = str(child_tupple[0][1][3])+' & '+ str(parent_tupple[0][1][3])
+                                    else:
+                                        parent_sig_f = ''
 
-                                                new_list = (parent_tupple_data,parent_index_f,parent_label_f,parent_sig_f)
-                                                data_frame[parent_tupple_index] = new_list
-                                                del data_frame[child_tupple_index]
+                                    if "full_count" in parent_tupple_data.columns:
+                                        parent_tupple_data = parent_tupple_data.drop(columns=['full_count'])
+                                    if any([x.startswith(('general_')) for x in parent_tupple_data.columns]):
+                                        parent_tupple_data['general_count_max'] = parent_tupple_data.filter(regex='^general_').max(axis=1)
+                                    else:
+                                        parent_tupple_data['category_count_max'] = parent_tupple_data.filter(regex='^category_').max(axis=1)
+                                    if 'comment' in daf_final.columns:
+                                        if daf_final.loc[daf_final['ID'] == parent_index_f, 'comment'].iloc[0] == "general_count_max":
+                                            parent_tupple_data = parent_tupple_data.loc[:, ~parent_tupple_data.columns.str.startswith('general_') | (parent_tupple_data.columns == 'general_count_max')]
+                                        if daf_final.loc[daf_final['ID'] == parent_index_f, 'comment'].iloc[0] == "category_count_max":
+                                            parent_tupple_data = parent_tupple_data.loc[:, ~parent_tupple_data.columns.str.startswith('category_') | (parent_tupple_data.columns == 'category_count_max')]
+                                    count_cols_to_drop = [col for col in parent_tupple_data.columns
+                                                if col.startswith('general_count_') and col != 'general_count_max']
+                                    count_cols_to_drop += [col for col in parent_tupple_data.columns
+                                                if col.startswith('category_count_') and col != 'category_count_max']
+                                    parent_tupple_data = parent_tupple_data.drop(columns=count_cols_to_drop)
+                                    new_list = (parent_tupple_data, parent_index_f, parent_label_f,parent_sig_f)
+                                    data_frame[parent_tupple_index] = new_list
+                                    del data_frame[child_tupple_index]
 
                         
                         disaggregations_perc_new = sorted(disaggregations_perc_new, key=lambda x: x[1])
@@ -685,8 +710,8 @@ def server(input:Inputs, output: Outputs, session:Session):
                         
                         tables_for_function ={
                             filename_toc: disaggregations_perc_new,
-                            filename_toc_count:disaggregations_count,
-                            filename_wide_toc:disaggregations_perc_new
+                            filename_toc_count: disaggregations_count,
+                            # filename_wide_toc: disaggregations_perc_new
                         }
                         
                         if weighting_column != None:
@@ -722,13 +747,13 @@ def server(input:Inputs, output: Outputs, session:Session):
 
                             buffer = io.BytesIO()
                             grouped_filename = filename + "_grouped.xlsx"
-                            construct_result_wide_table(disaggregations_perc_new, buffer)
+                            construct_result_wide_table(disaggregations_perc_new_for_group, buffer)
                             buffer.seek(0)
                             zipf.writestr(grouped_filename, buffer.read())
                             
                             buffer = io.BytesIO()
                             grouped_filename_count = grouped_filename.split('.')[0] + "_count" + ".xlsx"
-                            construct_count_wide_table(disaggregations_perc_new, buffer)
+                            construct_count_wide_table(disaggregations_perc_new_for_group, buffer)
                             buffer.seek(0)
                             zipf.writestr(grouped_filename_count, buffer.read())
                                 
@@ -746,7 +771,6 @@ def server(input:Inputs, output: Outputs, session:Session):
                         ui.modal_remove()
                         ui.modal_show(modal_error_fin)
                         
-                              
-  
-app = App(app_ui,server, debug=True)
+
+app = App(app_ui, server, debug=True)
 # app.run()
