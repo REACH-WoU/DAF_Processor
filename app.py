@@ -392,7 +392,7 @@ def server(input:Inputs, output: Outputs, session:Session):
                         if filter_daf.shape[0]>0:
                             
                             for col in filter_daf.columns:
-                                if col != 'ID':
+                                if col != 'ID' and filter_daf[col].dtype == 'object':
                                     filter_daf[col] = filter_daf[col].str.replace(' ', '')
                                     filter_daf[col] = filter_daf[col].str.replace("'", '')
                                     
@@ -408,10 +408,10 @@ def server(input:Inputs, output: Outputs, session:Session):
                                     condition_str = f"(data['{row['datasheet']}']['{row['variable']}'] {row['operation']} data['{row['datasheet']}']['{row['value']}'])"
                                 # If the value is a string and is equal
                                 elif isinstance(row['value'], str) and row['operation']=='==':
-                                    condition_str = f"(data['{row['datasheet']}']['{row['variable']}'].astype(str).str.contains('{row['value']}', regex=True))"
+                                    condition_str = f"(data['{row['datasheet']}']['{row['variable']}'].astype(str).str.fullmatch('{row['value']}'))"
                                 # If the value is a string and is not equal
                                 elif isinstance(row['value'], str) and row['operation']=='!=':
-                                    condition_str = f"(~data['{row['datasheet']}']['{row['variable']}'].astype(str).str.contains('{row['value']}', regex=True))"
+                                    condition_str = f"(~data['{row['datasheet']}']['{row['variable']}'].astype(str).str.fullmatch('{row['value']}'))"
                                 # Otherwise just keep as is
                                 else:
                                     condition_str = f"(data['{row['datasheet']}']['{row['variable']}'] {row['operation']} {row['value']})"
