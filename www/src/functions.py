@@ -1100,8 +1100,8 @@ def construct_result_table(tables_list, file_name, make_pivot_with_strata=False,
             for col_num, (column_name, value) in enumerate(row.items()):
                 if column_name not in ['disaggregations_category_1', 'disaggregations_category_2', 'admin_category', 'option', 
                             'strata_name', 'raion', 'oblast', 'macroregion', 'disaggregations_category_3'
-                            'count', 'full_count','weighted_count','unweighted_count','category_count', 'category_count_max', 'general_count', 'general_count_max'] and not column_name.startswith("mean")\
-                            and not column_name.startswith("moe_") and not column_name.startswith("median") and not column_name.startswith("max") and not column_name.startswith("min"):
+                            'count', 'full_count','weighted_count','unweighted_count','category_count', 'category_count_max', 'general_count', 'general_count_max'] and not str(column_name).startswith("mean")\
+                            and not str(column_name).startswith("moe_") and not str(column_name).startswith("median") and not str(column_name).startswith("max") and not str(column_name).startswith("min"):
                     if pd.isna(value):
                         data_sheet.write(row_num + 2 +cell_id, col_num, None)
                     elif values_variable not in ["mean", "count_mean", "value", "category_count"]:
